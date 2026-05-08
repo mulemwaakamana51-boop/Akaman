@@ -1,0 +1,179 @@
+const router = require("express").Router();
+const multer = require("multer");
+const multerS3 = require("multer-s3");
+const { S3Client, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { v4: uuidv4 } = require("uuid");
+const path = require("path");
+const { auth, requireCreator } = require("../middleware/auth");
+const { Content } = require("../models");
+
+// ── S3 client ────────────────────────────────────────────────────
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+// ── Allowed MIME types ────────────────────────────────────────────
+const ALLOWED = {
+  movie: ["video/mp4", "video/x-matroska", "video/quicktime", "video/x-msvideo"],
+  music: ["audio/mpeg", "audio/wav", "audio/flac", "audio/ogg", "audio/aac"],
+  news:  ["application/pdf", "text/plain"],
+  image: ["image/jpeg", "image/png", "image/webp"],
+};
+
+const fileFilter = (req, file, cb) => {
+  const allAllowed = Object.values(ALLOWED).flat();
+  if (allAllowed.includes(file.mimetype)) cb(null, true);
+  else cb(new Error(`File type ${file.mimetype} not allowed`), false);
+};
+
+// ── Multer + S3 storage ───────────────────────────────────────────
+const upload = multer({
+  fileFilter,
+  limits: { fileSize: 10 * 1024 * 1024 * 1024 }, // 10 GB
+  storage: multerS3({
+    s3,
+    bucket: process.env.AWS_BUCKET_NAME,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    metadata: (req, file, cb) => {
+      cb(null, { uploadedBy: req.user._id.toString() });
+    },
+    key: (req, file, cb) => {
+      const ext  = path.extname(file.originalname);
+      const type = req.body.type || "misc";
+      const key  = `${type}s/${req.user._id}/${uuidv4()}${ext}`;
+      cb(null, key);
+    },
+  }),
+});
+
+const thumbnailUpload = multer({
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED.image.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Only images allowed for thumbnails"), false);
+  },
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  storage: multerS3({
+    s3,
+    bucket: process.env.AWS_BUCKET_NAME,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    key: (req, file, cb) => {
+      const ext = path.extname(file.originalname);
+      cb(null, `thumbnails/${req.user._id}/${uuidv4()}${ext}`);
+    },
+  }),
+});
+
+// ── POST /api/upload/content  ─────────────────────────────────────
+// Body fields: title, description, type, genre, price, monetization (JSON string)
+router.post(
+  "/content",
+  auth,
+  requireCreator,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+      const { title, description, type, genre, price } = req.body;
+      const monetization = req.body.monetization
+        ? JSON.parse(req.body.monetization)
+        : { paidDownload: true, adSupported: false, subscriptionOnly: false, revenueShare: true };
+
+      const parsedPrice = parseFloat(price) || 0;
+
+      const content = await Content.create({
+        title,
+        description,
+        type,
+        genre,
+        creator:  req.user._id,
+        fileKey:  req.file.key,
+        fileUrl:  req.file.location,   // public S3 URL (if bucket is public)
+        price:    parsedPrice,
+        isFree:   parsedPrice === 0,
+        monetization,
+      });
+
+      res.status(201).json({ message: "Content uploaded successfully", content });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ── POST /api/upload/thumbnail/:contentId ─────────────────────────
+router.post(
+  "/thumbnail/:contentId",
+  auth,
+  requireCreator,
+  thumbnailUpload.single("thumbnail"),
+  async (req, res) => {
+    try {
+      const content = await Content.findOne({ _id: req.params.contentId, creator: req.user._id });
+      if (!content) return res.status(404).json({ error: "Content not found" });
+
+      content.thumbnailUrl = req.file.location;
+      await content.save();
+
+      res.json({ thumbnailUrl: content.thumbnailUrl });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ── GET /api/upload/download-url/:contentId ───────────────────────
+// Returns a signed S3 URL valid for 15 minutes — only for purchasers/subscribers
+router.get("/download-url/:contentId", auth, async (req, res) => {
+  try {
+    const content = await Content.findById(req.params.contentId);
+    if (!content) return res.status(404).json({ error: "Content not found" });
+
+    const user = req.user;
+    const hasPurchased = user.downloads.map(String).includes(String(content._id));
+    const hasPremiumAccess =
+      (user.plan === "premium" || user.plan === "standard") &&
+      content.monetization.subscriptionOnly;
+    const isFree = content.isFree || content.price === 0;
+
+    if (!isFree && !hasPurchased && !hasPremiumAccess)
+      return res.status(403).json({ error: "Purchase required to download" });
+
+    const command = new GetObjectCommand({
+      Bucket: process.env.AWS_BUCKET_NAME,
+      Key:    content.fileKey,
+    });
+
+    const url = await getSignedUrl(s3, command, { expiresIn: 900 }); // 15 min
+
+    // Track download
+    content.downloads += 1;
+    await content.save();
+
+    res.json({ url, expiresIn: 900 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE /api/upload/:contentId ─────────────────────────────────
+router.delete("/:contentId", auth, requireCreator, async (req, res) => {
+  try {
+    const content = await Content.findOne({ _id: req.params.contentId, creator: req.user._id });
+    if (!content) return res.status(404).json({ error: "Content not found" });
+
+    await s3.send(new DeleteObjectCommand({ Bucket: process.env.AWS_BUCKET_NAME, Key: content.fileKey }));
+    await content.deleteOne();
+
+    res.json({ message: "Content deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
