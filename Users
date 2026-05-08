@@ -1,0 +1,57 @@
+const router = require("express").Router();
+const { auth } = require("../middleware/auth");
+const { User, Content } = require("../models");
+
+// ── GET /api/users/:id/profile  (public) ─────────────────────────
+router.get("/:id/profile", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select("username avatar role plan totalEarned createdAt");
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const contentCount = await Content.countDocuments({ creator: user._id, published: true });
+    res.json({ user, contentCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/users/:id/content  (public creator library) ─────────
+router.get("/:id/content", async (req, res) => {
+  try {
+    const contents = await Content.find({ creator: req.params.id, published: true })
+      .sort("-createdAt")
+      .limit(20);
+    res.json({ contents });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/users/me  (update own profile) ────────────────────
+router.patch("/me", auth, async (req, res) => {
+  try {
+    const allowed = ["username", "avatar"];
+    allowed.forEach((f) => {
+      if (req.body[f] !== undefined) req.user[f] = req.body[f];
+    });
+    await req.user.save();
+    res.json({ user: req.user.toSafeObject() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/users/leaderboard  (top earners) ────────────────────
+router.get("/leaderboard/top", async (req, res) => {
+  try {
+    const creators = await User.find({ role: { $in: ["creator", "admin"] } })
+      .select("username avatar totalEarned")
+      .sort("-totalEarned")
+      .limit(10);
+    res.json({ creators });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
