@@ -1,0 +1,107 @@
+const router = require("express").Router();
+const { auth } = require("../middleware/auth");
+const { Content } = require("../models");
+
+// ── GET /api/content  (browse with filters) ───────────────────────
+router.get("/", async (req, res) => {
+  try {
+    const { type, genre, search, sort = "createdAt", page = 1, limit = 20 } = req.query;
+    const query = { published: true };
+
+    if (type)   query.type  = type;
+    if (genre)  query.genre = new RegExp(genre, "i");
+    if (search) query.$text = { $search: search };
+
+    const sortMap = {
+      newest:    { createdAt: -1 },
+      popular:   { views: -1 },
+      downloads: { downloads: -1 },
+      rating:    { rating: -1 },
+    };
+
+    const total    = await Content.countDocuments(query);
+    const contents = await Content.find(query)
+      .populate("creator", "username avatar")
+      .sort(sortMap[sort] || sortMap.newest)
+      .skip((page - 1) * limit)
+      .limit(parseInt(limit));
+
+    res.json({ contents, total, page: +page, pages: Math.ceil(total / limit) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/content/trending ────────────────────────────────────
+router.get("/trending", async (req, res) => {
+  try {
+    const contents = await Content.find({ published: true })
+      .populate("creator", "username avatar")
+      .sort({ views: -1, downloads: -1 })
+      .limit(12);
+    res.json({ contents });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/content/:id ─────────────────────────────────────────
+router.get("/:id", async (req, res) => {
+  try {
+    const content = await Content.findById(req.params.id)
+      .populate("creator", "username avatar role");
+    if (!content) return res.status(404).json({ error: "Content not found" });
+
+    content.views += 1;
+    await content.save();
+
+    res.json({ content });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/content/:id  (creator update) ──────────────────────
+router.patch("/:id", auth, async (req, res) => {
+  try {
+    const content = await Content.findOne({ _id: req.params.id, creator: req.user._id });
+    if (!content) return res.status(404).json({ error: "Content not found" });
+
+    const allowed = ["title", "description", "genre", "price", "monetization", "published"];
+    allowed.forEach((field) => {
+      if (req.body[field] !== undefined) content[field] = req.body[field];
+    });
+
+    if (req.body.price !== undefined) {
+      content.isFree = parseFloat(req.body.price) === 0;
+    }
+
+    await content.save();
+    res.json({ content });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/content/:id/rate ────────────────────────────────────
+router.post("/:id/rate", auth, async (req, res) => {
+  try {
+    const { rating } = req.body;
+    if (!rating || rating < 1 || rating > 5)
+      return res.status(400).json({ error: "Rating must be 1–5" });
+
+    const content = await Content.findById(req.params.id);
+    if (!content) return res.status(404).json({ error: "Content not found" });
+
+    const newTotal = content.rating * content.ratingCount + rating;
+    content.ratingCount += 1;
+    content.rating = +(newTotal / content.ratingCount).toFixed(2);
+    await content.save();
+
+    res.json({ rating: content.rating, ratingCount: content.ratingCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
