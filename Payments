@@ -1,0 +1,236 @@
+const router = require("express").Router();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { auth } = require("../middleware/auth");
+const { User, Content, Purchase } = require("../models");
+
+// ── Helper: get or create Stripe customer ─────────────────────────
+async function getOrCreateCustomer(user) {
+  if (user.stripeCustomerId) return user.stripeCustomerId;
+  const customer = await stripe.customers.create({ email: user.email, name: user.username });
+  user.stripeCustomerId = customer.id;
+  await user.save();
+  return customer.id;
+}
+
+// ── POST /api/payments/checkout  (one-time download purchase) ─────
+router.post("/checkout", auth, async (req, res) => {
+  try {
+    const { contentId } = req.body;
+    const content = await Content.findById(contentId).populate("creator", "username");
+    if (!content) return res.status(404).json({ error: "Content not found" });
+    if (content.price <= 0) return res.status(400).json({ error: "This content is free" });
+
+    // Check not already purchased
+    const already = await Purchase.findOne({ user: req.user._id, content: contentId, status: "completed" });
+    if (already) return res.status(409).json({ error: "Already purchased" });
+
+    const customerId = await getOrCreateCustomer(req.user);
+
+    const session = await stripe.checkout.sessions.create({
+      customer:   customerId,
+      mode:       "payment",
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency:     "usd",
+            unit_amount:  Math.round(content.price * 100),
+            product_data: {
+              name:        content.title,
+              description: `${content.type} · ${content.genre}`,
+              images:      content.thumbnailUrl ? [content.thumbnailUrl] : [],
+            },
+          },
+        },
+      ],
+      metadata: {
+        userId:    req.user._id.toString(),
+        contentId: contentId,
+      },
+      success_url: `${process.env.CLIENT_URL}/download-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.CLIENT_URL}/content/${contentId}`,
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/payments/subscribe  (Standard or Premium plan) ──────
+router.post("/subscribe", auth, async (req, res) => {
+  try {
+    const { plan } = req.body; // "standard" | "premium"
+    const priceId =
+      plan === "premium"
+        ? process.env.STRIPE_PREMIUM_PRICE_ID
+        : process.env.STRIPE_STANDARD_PRICE_ID;
+
+    if (!priceId) return res.status(400).json({ error: "Invalid plan" });
+
+    const customerId = await getOrCreateCustomer(req.user);
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode:     "subscription",
+      line_items: [{ price: priceId, quantity: 1 }],
+      metadata: {
+        userId: req.user._id.toString(),
+        plan,
+      },
+      success_url: `${process.env.CLIENT_URL}/subscription-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.CLIENT_URL}/pricing`,
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/payments/cancel-subscription ────────────────────────
+router.post("/cancel-subscription", auth, async (req, res) => {
+  try {
+    if (!req.user.stripeSubscriptionId)
+      return res.status(400).json({ error: "No active subscription" });
+
+    await stripe.subscriptions.update(req.user.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+
+    res.json({ message: "Subscription will cancel at end of billing period" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/payments/purchases ───────────────────────────────────
+router.get("/purchases", auth, async (req, res) => {
+  try {
+    const purchases = await Purchase.find({ user: req.user._id, status: "completed" })
+      .populate("content", "title type genre thumbnailUrl price")
+      .sort("-createdAt");
+    res.json({ purchases });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/payments/creator-earnings ───────────────────────────
+router.get("/creator-earnings", auth, async (req, res) => {
+  try {
+    const contents = await Content.find({ creator: req.user._id }).select("_id title downloads adRevenue price");
+    const contentIds = contents.map((c) => c._id);
+
+    const purchases = await Purchase.find({
+      content: { $in: contentIds },
+      status: "completed",
+    });
+
+    const totalDownloadRevenue = purchases.reduce((sum, p) => sum + p.amount * 0.85, 0);
+    const totalAdRevenue = contents.reduce((sum, c) => sum + (c.adRevenue || 0), 0);
+
+    res.json({
+      totalEarned:         +(totalDownloadRevenue + totalAdRevenue).toFixed(2),
+      downloadRevenue:     +totalDownloadRevenue.toFixed(2),
+      adRevenue:           +totalAdRevenue.toFixed(2),
+      totalDownloads:      purchases.length,
+      contentCount:        contents.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/payments/webhook  (Stripe webhooks) ────────────────
+router.post("/webhook", async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("Webhook signature error:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      // ── One-time purchase completed ────────────────────────────
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        if (session.mode !== "payment") break;
+
+        const { userId, contentId } = session.metadata;
+        const content = await Content.findById(contentId);
+        if (!content) break;
+
+        await Purchase.create({
+          user:            userId,
+          content:         contentId,
+          amount:          session.amount_total / 100,
+          stripePaymentId: session.payment_intent,
+          status:          "completed",
+        });
+
+        // Give creator 85% cut
+        const creatorShare = (session.amount_total / 100) * 0.85;
+        await User.findByIdAndUpdate(content.creator, { $inc: { totalEarned: creatorShare } });
+
+        // Add to user's downloads
+        await User.findByIdAndUpdate(userId, { $addToSet: { downloads: contentId } });
+
+        content.downloads += 1;
+        await content.save();
+        break;
+      }
+
+      // ── Subscription activated / renewed ──────────────────────
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const sub = event.data.object;
+        const customer = await stripe.customers.retrieve(sub.customer);
+        const user = await User.findOne({ email: customer.email });
+        if (!user) break;
+
+        const isActive = ["active", "trialing"].includes(sub.status);
+        const priceId  = sub.items.data[0]?.price.id;
+
+        let plan = "free";
+        if (isActive) {
+          plan = priceId === process.env.STRIPE_PREMIUM_PRICE_ID ? "premium" : "standard";
+        }
+
+        user.plan = plan;
+        user.stripeSubscriptionId = sub.id;
+        await user.save();
+        break;
+      }
+
+      // ── Subscription cancelled ────────────────────────────────
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        const customer = await stripe.customers.retrieve(sub.customer);
+        const user = await User.findOne({ email: customer.email });
+        if (user) {
+          user.plan = "free";
+          user.stripeSubscriptionId = "";
+          await user.save();
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook handler error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
