@@ -1,0 +1,84 @@
+const router = require("express").Router();
+const jwt = require("jsonwebtoken");
+const { body, validationResult } = require("express-validator");
+const { User } = require("../models");
+const { auth } = require("../middleware/auth");
+
+const signToken = (id) =>
+  jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || "7d" });
+
+// POST /api/auth/register
+router.post(
+  "/register",
+  [
+    body("username").trim().isLength({ min: 3 }).withMessage("Username min 3 chars"),
+    body("email").isEmail().withMessage("Valid email required"),
+    body("password").isLength({ min: 6 }).withMessage("Password min 6 chars"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { username, email, password, becomeCreator } = req.body;
+
+      const exists = await User.findOne({ $or: [{ email }, { username }] });
+      if (exists) return res.status(409).json({ error: "Email or username already taken" });
+
+      const user = await User.create({
+        username,
+        email,
+        password,
+        role: becomeCreator ? "creator" : "user",
+      });
+
+      const token = signToken(user._id);
+      res.status(201).json({ token, user: user.toSafeObject() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// POST /api/auth/login
+router.post(
+  "/login",
+  [
+    body("email").isEmail(),
+    body("password").notEmpty(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+      const { email, password } = req.body;
+      const user = await User.findOne({ email });
+      if (!user || !(await user.comparePassword(password)))
+        return res.status(401).json({ error: "Invalid email or password" });
+
+      const token = signToken(user._id);
+      res.json({ token, user: user.toSafeObject() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// GET /api/auth/me  (protected)
+router.get("/me", auth, (req, res) => {
+  res.json({ user: req.user.toSafeObject() });
+});
+
+// POST /api/auth/become-creator  (protected)
+router.post("/become-creator", auth, async (req, res) => {
+  try {
+    req.user.role = "creator";
+    await req.user.save();
+    res.json({ message: "Creator account activated", user: req.user.toSafeObject() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
